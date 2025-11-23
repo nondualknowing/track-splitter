@@ -1,0 +1,13 @@
+[package]
+name = "track-splitter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9.9"
+rayon = "1.11.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
