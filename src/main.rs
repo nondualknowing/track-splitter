@@ -94,6 +94,6 @@ fn main() -> io::Result<()> {
     let sample_count = wav_file.mmap.len() / 8;
 
     //println!("Squares: {:?}", squares);
-    println!("RMS value: {:?} over {}:{}:{} calculated in {} ms", rms, sample_count / 48000 / 3600, (sample_count / 48000 / 60) % 60, (sample_count / 48000) % 60, elapsed_time.as_millis());
+    println!("RMS value: {:?} over {}:{:02}:{:02} calculated in {} ms", rms, sample_count / 48000 / 3600, (sample_count / 48000 / 60) % 60, (sample_count / 48000) % 60, elapsed_time.as_millis());
     Ok(())
 }
