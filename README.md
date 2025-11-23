@@ -1,2 +1,6 @@
 # track-splitter
-Splits wave files into separate tracks. This is the ultimate goal but I just started so far this just calculates RMS loudness for a specific format of wav file (i32 PCM stereo) using SIMD and parallelism. This is my first Rust project.
+Goal: Splits wave files into separate tracks.
+
+So far: Calculates RMS values using SIMD and parallelism and finds all the gaps in an i32 PCM stereo wav file. I've been testing it on a 42 hour wav file and it takes about 500 ms to calculate the RMS level. The silence finder says my file has a 302 minute silence and a 177 minute silence.
+
+This is my first Rust project! :-)
