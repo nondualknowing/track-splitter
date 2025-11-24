@@ -1,10 +1,11 @@
-//use std::slice;
 #![feature(portable_simd)]
+#![feature(binary_heap_into_iter_sorted)]
 
 use std::cmp::Ordering;
-use std::env;
+use std::{env, fs};
 use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::simd::f64x32;
 use std::simd::u64x32;
 use std::simd::i32x32;
@@ -12,8 +13,9 @@ use std::simd::prelude::*;
 use memmap2::MmapOptions;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::time::Instant;
-use std::collections::BinaryHeap;
+use mp3lame_encoder::{Builder, /*Id3Tag,*/ InterleavedPcm, FlushNoGap};
+use std::thread::scope;
+use std::sync::mpsc;
 
 fn is_valid_wav_header(header: &[u8]) -> bool {
     header.len() >= 12 &&
@@ -67,20 +69,42 @@ where
     }
 }
 
-fn rms(sum_squares : &(f64x32, u64x32)) -> f64 {
-    (sum_squares.0.reduce_sum() / (sum_squares.1.cast() as f64x32).reduce_sum()).sqrt()
+pub trait IsZero {
+    fn is_zero(&self) -> bool;
 }
 
-pub struct SilenceIter<'a, T> {
-    data: &'a[T],
-    current: Option<&'a[T]>,
-    empty: bool,
+impl IsZero for i32x32
+//where
+//    std::simd::LaneCount<32>: std::simd::SupportedLaneCount,
+//    f64: std::simd::SimdElement,
+//    std::simd::Simd<i32, 32>: Sync,
+{
+    fn is_zero(&self) -> bool {
+        const THRESHOLD: i32 = 0; // 0 = Look only for digital zero values. Works best with a digital recording.
+        // Try using a larger value if you have an analog recording. These are i32 values so they should be quite
+        // large compared to if they were i16 values.
+        const MIN: i32x32 = Simd::splat(-THRESHOLD);
+        const MAX: i32x32 = Simd::splat(THRESHOLD);
+
+        if self > &MAX {
+            return false;
+        } else if self < &MIN {
+            return false;
+        }
+        true
+    }
 }
 
-impl<'a, T: std::cmp::PartialEq<i32x32>> Iterator for SilenceIter<'a, T> {
-    type Item = &'a [T];
+pub struct SilenceIter<'a> {
+    data: &'a[i32x32], // reference to entire file
+    current: Option<&'a [i32x32]>, // reference to slice containing a silence period
+    empty: bool, // true if there are no silence periods
+}
 
-    fn next(&mut self) -> Option<&'a [T]> {
+impl<'a> Iterator for SilenceIter<'a> {
+    type Item = &'a [i32x32];
+
+    fn next(&mut self) -> Option<&'a [i32x32]> {
         if self.empty {
             return None;
         }
@@ -95,12 +119,11 @@ impl<'a, T: std::cmp::PartialEq<i32x32>> Iterator for SilenceIter<'a, T> {
             (self.current?.as_ptr() as usize - self.data.as_ptr() as usize + self.current?.len()*128) / 128
         };
 
-        const ZERO: i32x32 = Simd::splat(0_i32);
         let mut i = search_start;
         while i < self.data.len() {
-            if self.data[i] == ZERO {
+            if self.data[i].is_zero() {
                 let silence_start = i;
-                while i < self.data.len() && self.data[i] == ZERO {
+                while i < self.data.len() && self.data[i].is_zero() {
                     i += 1;
                 };
                 self.current = Option::from(&self.data[silence_start..i]);
@@ -116,53 +139,7 @@ impl<'a, T: std::cmp::PartialEq<i32x32>> Iterator for SilenceIter<'a, T> {
     }
 }
 
-impl<'a, T: std::cmp::PartialEq<i32x32>> DoubleEndedIterator for SilenceIter<'a, T> {
-    fn next_back(&mut self) -> Option<&'a [T]> {
-        if self.empty {
-            return None;
-        }
-        let search_start : usize = if self.current.is_none() {
-            self.data.len()/128 - 1
-        } else {
-            if self.current?.as_ptr() == self.data.as_ptr() {
-                self.current = None;
-                return self.current;
-            }
-            // initialize to the item before the beginning of the current silent section
-            (self.current?.as_ptr() as usize - self.data.as_ptr() as usize) / 128 - 1
-        };
-
-        const ZERO: i32x32 = Simd::splat(0_i32);
-        let mut i = search_start;
-        while i > 0 {
-            if self.data[i] == ZERO {
-                let silence_end = i;
-                while i > 0 && self.data[i] == ZERO {
-                    i -= 1;
-                };
-                if self.data[i] != ZERO {
-                    self.current = Option::from(&self.data[i + 1..silence_end + 1]);
-                    return self.current;
-                } else {
-                    self.current = Option::from(&self.data[i..silence_end + 1]);
-                    return self.current;
-                }
-            }
-            i -= 1;
-        }
-        if self.data[i] != ZERO {
-            if self.current.is_none() {
-                self.empty = true;
-            }
-            self.current = None;
-            return self.current;
-        } else {
-            self.current = Option::from(&self.data[0..1]);
-            return self.current;
-        }
-    }
-}
-
+#[derive(Clone)]
 struct SilenceHeapValue<'a>(&'a [i32x32]);
 
 impl<'a> SilenceHeapValue<'a> {
@@ -173,6 +150,16 @@ impl<'a> SilenceHeapValue<'a> {
     fn get_inner_value(&self) -> &'a [i32x32] {
         &self.0
     }
+
+    fn gap(&self, prev : SilenceHeapValue) -> &'a [i32x32] {
+        let prev_end = prev.get_inner_value().as_ptr() as usize + prev.get_inner_value().len() * 128;
+        unsafe {
+            std::slice::from_raw_parts(prev_end as *const i32x32, (self.get_inner_value().as_ptr() as usize - prev_end) / 128)
+        }
+    }
+
+    pub const GAPSAMPLES : usize = 48000/16; // 62.5 ms
+    pub const TRACKSAMPLES : usize = 48000 * 25;
 }
 
 impl<'a> PartialEq for SilenceHeapValue<'a> {
@@ -200,6 +187,43 @@ impl<'a> Ord for SilenceHeapValue<'a> {
     }
 }
 
+fn write_mp3(name: String, data: &[i32x32]) {
+    let mut mp3_encoder = Builder::new().expect("Create LAME builder");
+    mp3_encoder.set_num_channels(2).expect("set channels");
+    mp3_encoder.set_sample_rate(48_000).expect("set sample rate");
+//    mp3_encoder.set
+    mp3_encoder.set_brate(mp3lame_encoder::Bitrate::Kbps192).expect("set brate");
+    mp3_encoder.set_quality(mp3lame_encoder::Quality::Best).expect("set quality");
+    /*    mp3_encoder.set_id3_tag(Id3Tag {
+            title: b"My title",
+            artist: &[],
+            album: b"My album",
+            album_art: &[],
+            year: b"Current year",
+            comment: b"Just my comment",
+        });*/
+    let mut mp3_encoder = mp3_encoder.build().expect("To initialize LAME encoder");
+    let mut mp3_out_buffer = Vec::new();
+
+    //let mut encoded_size : usize = 0;
+    for block in data {
+        let array = block.to_array();
+
+        let input = InterleavedPcm(&array);
+        mp3_out_buffer.reserve(mp3lame_encoder::max_required_buffer_size(array.len()/2));
+        let encoded_size = mp3_encoder.encode(input, mp3_out_buffer.spare_capacity_mut()).expect("To encode");
+        unsafe {
+            mp3_out_buffer.set_len(mp3_out_buffer.len().wrapping_add(encoded_size));
+        }
+    }
+
+    let encoded_size = mp3_encoder.flush::<FlushNoGap>(mp3_out_buffer.spare_capacity_mut()).expect("to flush");
+    unsafe {
+        mp3_out_buffer.set_len(mp3_out_buffer.len().wrapping_add(encoded_size));
+    }
+    fs::write(name, mp3_out_buffer).expect("Failed to write MP3 data");
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -209,29 +233,44 @@ fn main() -> io::Result<()> {
     }
     let wav_file = WavFile::open(&args[1]).expect("Failed to open file");
 
-    let start_time = Instant::now();
-    let squares = wav_file.get_data_i32().sum_squares();
-    let rms = rms(&squares);
-    let elapsed_time = start_time.elapsed();
-    let sample_count = wav_file.mmap.len() / 8; // i32 pcm stereo
-
-    //println!("Squares: {:?}", squares);
-    println!("RMS value: {:?} over {}:{:02}:{:02} calculated in {} ms", rms, sample_count / 48000 / 3600, (sample_count / 48000 / 60) % 60, (sample_count / 48000) % 60, elapsed_time.as_millis());
-
     let silence_iter = SilenceIter { data: wav_file.get_data_i32(), current: None, empty: false };
-    let mut silence_heap : BinaryHeap<SilenceHeapValue> = BinaryHeap::new();
+    let mut last_silence : Option<SilenceHeapValue> = None;
+    let mut tracks : Vec<&[i32x32]> = Vec::new();
     for silence in silence_iter {
-        silence_heap.push(SilenceHeapValue::new(&silence));
+        // FIXME: get rid of clones
+        let wrapped_silence = SilenceHeapValue::new(silence);
+        if !last_silence.is_none() {
+            let loud_samples = wrapped_silence.gap(last_silence.clone().unwrap());
+            if wrapped_silence.get_inner_value().len()*16 >= SilenceHeapValue::GAPSAMPLES && loud_samples.len()*16 >= SilenceHeapValue::TRACKSAMPLES {
+                last_silence = Option::from(wrapped_silence.clone());
+                tracks.push(loud_samples);
+            }
+        } else {
+            last_silence = Option::from(wrapped_silence.clone());
+        }
     }
+    let track_count = tracks.len();
+    println!("Number of tracks? {}\n", track_count);
 
-    let biggest_silences: Vec<_> = silence_heap.iter().take(10).collect();
-    for silence_wrapper in biggest_silences {
-        let silence = silence_wrapper.get_inner_value();
-        let silence_begin = (silence.as_ptr() as usize - wav_file.get_data_i32().as_ptr() as usize) / 128;
+    let it = tracks.into_par_iter().enumerate();
 
-        println!("Silence: at {:?} minutes and {}:{:02}:{:03} mm:ss:ms long", silence_begin*16 / 48000 / 60,
-                 silence.len()*16 / 48000 / 60, (silence.len()*16 / 48000)%60, (silence.len()*16 / 48)%1000);
-    }
-    println!("Number of silences: {}", silence_heap.len());
+    scope(|s| {
+        let (tx, rx) = mpsc::channel();
+
+        s.spawn(move || {
+            it.for_each(|track: (usize, &[i32x32])| {
+                write_mp3(format!("tracks/{:05}.mp3", track.0), track.1);
+                tx.send(true).unwrap();
+            });
+        });
+
+        for i in 0..track_count {
+            print!("\rWriting track {}/{}...", i, track_count);
+            io::stdout().flush().unwrap();
+            let _ = rx.recv().unwrap();
+        }
+    });
+    println!("\nDone!");
+
     Ok(())
 }

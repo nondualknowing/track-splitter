@@ -1,6 +1,10 @@
 # track-splitter
-Goal: Splits wave files into separate tracks.
+Splits wav files into separate tracks and encodes them as mp3.
 
-So far: Calculates RMS values using SIMD and parallelism and finds all the gaps in an i32 PCM stereo wav file. I've been testing it on a 42 hour wav file and it takes about 500 ms to calculate the RMS level. The silence finder says my file has a 302 minute silence and a 177 minute silence.
+So far, it works only with i32 PCM stereo wav files, however it handles very large files, tested to 59 gigabytes. It encodes the mp3s in parallel using multiple cores.
 
-This is my first Rust project! :-)
+It looks for silence between tracks which isn't very foolproof but it splits the 59 gig file into 412 tracks which is a lot better for an mp3 player than having one single file.
+
+Future work: Use ML to identify track transitions to make this work better.
+
+This was my first Rust project! :-)
